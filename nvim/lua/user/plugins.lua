@@ -44,6 +44,8 @@ return packer.startup(function(use)
     'nvim-telescope/telescope.nvim',
     requires = { {'nvim-lua/plenary.nvim'} }
   }
+
+  use { "nvim-telescope/telescope-file-browser.nvim" }
   use "tpope/vim-commentary"
   use {
     'nvim-lualine/lualine.nvim',
