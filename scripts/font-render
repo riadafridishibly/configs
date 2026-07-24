@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+"""Render a large specimen sheet for a font file, using only that font.
+
+    ./font-render path/to/Font.ttf
+    ./font-render Font.ttf -s 220 --dark
+    ./font-render Font.ttf -t "Ssa0Og" -s 400
+    ./font-render Font.ttf --html
+
+Glyphs are rasterised through FreeType/HarfBuzz with the given face only, so
+anything the font lacks shows up as .notdef rather than a substituted glyph.
+"""
+
+import argparse
+import base64
+import math
+import platform
+import subprocess
+import sys
+from pathlib import Path
+
+try:
+    from PIL import Image, ImageDraw, ImageFont, features
+except ImportError:
+    sys.exit("font-render needs Pillow:  pip3 install pillow")
+
+UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+LOWER = "abcdefghijklmnopqrstuvwxyz"
+DIGITS = "0123456789"
+PUNCT = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+
+DEFAULT_SETS = [("Uppercase", UPPER), ("Lowercase", LOWER),
+                ("Digits", DIGITS), ("Punctuation & symbols", PUNCT)]
+
+WATERFALL_TEXT = "Hamburgefonstiv 0O1lI {}[]() ->=="
+WATERFALL_SIZES = [72, 48, 36, 28, 22, 18, 15, 13, 11, 9]
+
+SAMPLES = [
+    "The quick brown fox jumps over the lazy dog",
+    "Pack my box with five dozen liquor jugs 0123456789",
+    "0O oQ 1lI| 2Z 5S 8B rn/m cl/d vv/w ;: ,. '\" -_ ~^",
+    "-> => != !== <= >= === ++ -- << >> ... :: |> <$> /* */",
+    "const sum = (a, b) => a + b;  // x != y && z >= 0",
+    "if (i <= n) { arr[i] = *ptr++; }  /* #!/usr/bin/env */",
+]
+
+THEMES = {
+    "light": dict(bg=(255, 255, 255), ink=(20, 20, 20), label=(150, 150, 150),
+                  rule=(228, 228, 228), guide=(226, 232, 240),
+                  baseline=(190, 200, 214), side=(244, 214, 214),
+                  cell=(250, 250, 250)),
+    "dark": dict(bg=(22, 22, 26), ink=(238, 238, 240), label=(120, 120, 128),
+                 rule=(52, 52, 58), guide=(48, 56, 68),
+                 baseline=(80, 92, 110), side=(96, 62, 62),
+                 cell=(30, 30, 35)),
+}
+
+UI_FONT_CANDIDATES = [
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/System/Library/Fonts/Helvetica.ttc",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+]
+
+
+def ui_font(size):
+    for path in UI_FONT_CANDIDATES:
+        if Path(path).exists():
+            try:
+                return ImageFont.truetype(path, size)
+            except OSError:
+                continue
+    return ImageFont.load_default(size)
+
+
+def apply_variations(face, variations):
+    """Set variable-font axes from a list of (tag_or_name, value)."""
+    if not variations:
+        return
+    try:
+        axes = face.get_variation_axes()
+    except OSError:
+        sys.exit("--var given but this font has no variation axes")
+    values = [a["default"] for a in axes]
+    for name, value in variations:
+        for i, axis in enumerate(axes):
+            tag = axis.get("name", b"")
+            tag = tag.decode() if isinstance(tag, bytes) else str(tag)
+            if tag.lower().startswith(name.lower()) or name.lower() in tag.lower():
+                values[i] = value
+                break
+        else:
+            named = [a.get("name") for a in axes]
+            sys.exit(f"no axis matching {name!r}; font has {named}")
+    face.set_variation_by_axes(values)
+
+
+class Sheet:
+    """Vertical-cursor canvas; allocated tall, cropped to what was drawn."""
+
+    def __init__(self, width, height, theme, pad):
+        self.img = Image.new("RGB", (width, height), theme["bg"])
+        self.d = ImageDraw.Draw(self.img)
+        self.theme = theme
+        self.pad = pad
+        self.w = width
+        self.y = pad
+
+    def heading(self, text, size=22):
+        f = ui_font(size)
+        self.y += size // 2
+        self.d.text((self.pad, self.y), text, font=f, fill=self.theme["label"])
+        self.y += size + 8
+        self.d.line((self.pad, self.y, self.w - self.pad, self.y),
+                    fill=self.theme["rule"])
+        self.y += size // 2
+
+    def finish(self):
+        return self.img.crop((0, 0, self.w, min(self.y + self.pad, self.img.height)))
+
+
+def dashed(draw, y, x0, x1, colour, dash=6, gap=6):
+    x = x0
+    while x < x1:
+        draw.line((x, y, min(x + dash, x1), y), fill=colour)
+        x += dash + gap
+
+
+def draw_grid(sheet, face, chars, cols, guides, features_list):
+    th, d = sheet.theme, sheet.d
+    ascent, descent = face.getmetrics()
+    advance = max(d.textlength(c, font=face) for c in chars)
+    cell_w = int(advance * 1.7) + 24
+    cell_h = int((ascent + descent) * 1.35) + 34
+    baseline_off = int(ascent * 1.15)
+
+    x_top = face.getbbox("x")[1]
+    cap_top = face.getbbox("H")[1]
+
+    for i, ch in enumerate(chars):
+        col, row = i % cols, i // cols
+        x0 = sheet.pad + col * cell_w
+        y0 = sheet.y + row * cell_h
+        cx = x0 + cell_w // 2
+        base = y0 + baseline_off
+
+        d.rectangle((x0, y0, x0 + cell_w - 2, y0 + cell_h - 2), fill=th["cell"])
+
+        if guides:
+            gx0, gx1 = x0 + 4, x0 + cell_w - 6
+            dashed(d, base - (ascent - x_top), gx0, gx1, th["guide"])
+            dashed(d, base - (ascent - cap_top), gx0, gx1, th["guide"])
+            dashed(d, base - ascent, gx0, gx1, th["guide"])
+            dashed(d, base + descent, gx0, gx1, th["guide"])
+            d.line((gx0, base, gx1, base), fill=th["baseline"])
+            adv = d.textlength(ch, font=face)
+            for sx in (cx - adv / 2, cx + adv / 2):
+                d.line((sx, y0 + 4, sx, y0 + cell_h - 24), fill=th["side"])
+
+        d.text((cx, base), ch, font=face, fill=th["ink"], anchor="ms",
+               features=features_list)
+        d.text((cx, y0 + cell_h - 18), f"U+{ord(ch):04X}", font=ui_font(11),
+               fill=th["label"], anchor="ma")
+
+    sheet.y += math.ceil(len(chars) / cols) * cell_h + 10
+
+
+def draw_lines(sheet, path, index, layout, variations, features_list,
+               entries, gutter):
+    """entries: list of (size, text). Renders each on its own baseline."""
+    th, d = sheet.theme, sheet.d
+    for size, text in entries:
+        face = ImageFont.truetype(str(path), size, index=index, layout_engine=layout)
+        apply_variations(face, variations)
+        ascent, descent = face.getmetrics()
+        d.text((sheet.pad + gutter, sheet.y + ascent), text, font=face,
+               fill=th["ink"], anchor="ls", features=features_list)
+        if gutter:
+            d.text((sheet.pad, sheet.y + ascent), f"{size}", font=ui_font(11),
+                   fill=th["label"], anchor="ls")
+        sheet.y += ascent + descent + max(6, size // 5)
+
+
+def measure_lines(path, index, layout, variations, features_list, entries):
+    width = height = 0
+    img = Image.new("RGB", (1, 1))
+    d = ImageDraw.Draw(img)
+    for size, text in entries:
+        face = ImageFont.truetype(str(path), size, index=index, layout_engine=layout)
+        apply_variations(face, variations)
+        ascent, descent = face.getmetrics()
+        width = max(width, int(d.textlength(text, font=face, features=features_list)))
+        height += ascent + descent + max(6, size // 5)
+    return width, height
+
+
+def render_png(args, path, layout, variations, features_list):
+    theme = THEMES["dark" if args.dark else "light"]
+    pad = 40
+
+    face = ImageFont.truetype(str(path), args.size, index=args.index,
+                              layout_engine=layout)
+    apply_variations(face, variations)
+    family, style = face.getname()
+
+    sets = [("Custom", args.text)] if args.text else DEFAULT_SETS
+    sets = [(name, chars) for name, chars in sets if chars]
+
+    img = Image.new("RGB", (1, 1))
+    probe = ImageDraw.Draw(img)
+    advance = max(probe.textlength(c, font=face)
+                  for _, chars in sets for c in chars)
+    cell_w = int(advance * 1.7) + 24
+    ascent, descent = face.getmetrics()
+    cell_h = int((ascent + descent) * 1.35) + 34
+
+    cols = args.cols or max(1, min(13, max(len(c) for _, c in sets)))
+    cols = min(cols, max(len(c) for _, c in sets))
+
+    want = lambda block: args.only in (None, block)  # noqa: E731
+    waterfall = [(s, WATERFALL_TEXT) for s in WATERFALL_SIZES] if want("waterfall") else []
+    samples = [(args.sample_size, t) for t in SAMPLES] if want("samples") else []
+
+    wf_w, wf_h = measure_lines(path, args.index, layout, variations,
+                               features_list, waterfall)
+    sp_w, sp_h = measure_lines(path, args.index, layout, variations,
+                               features_list, samples)
+
+    width = max(cols * cell_w, wf_w + 60, sp_w) + pad * 2
+    grid_h = sum(math.ceil(len(c) / cols) * cell_h + 60 for _, c in sets)
+    height = pad * 2 + 120 + grid_h + wf_h + sp_h + 300
+
+    sheet = Sheet(width, height, theme, pad)
+
+    title = ui_font(30)
+    sheet.d.text((pad, sheet.y), f"{family} {style}", font=title, fill=theme["ink"])
+    sheet.y += 38
+    meta = (f"{path.name}   ·   grid {args.size}px   ·   "
+            f"ascent {ascent}px / descent {descent}px   ·   {face.font.family}")
+    sheet.d.text((pad, sheet.y), meta, font=ui_font(13), fill=theme["label"])
+    sheet.y += 26
+
+    if not args.only or args.only == "grid":
+        for name, chars in sets:
+            sheet.heading(f"{name}  ({len(chars)})")
+            draw_grid(sheet, face, chars, cols, not args.no_guides, features_list)
+
+    if waterfall:
+        sheet.heading("Waterfall")
+        draw_lines(sheet, path, args.index, layout, variations, features_list,
+                   waterfall, gutter=34)
+
+    if samples:
+        sheet.heading(f"Samples  ({args.sample_size}px)")
+        draw_lines(sheet, path, args.index, layout, variations, features_list,
+                   samples, gutter=0)
+
+    out = Path(args.out) if args.out else path.with_suffix(".specimen.png")
+    sheet.finish().save(out)
+    return out
+
+
+HTML = """<meta charset="utf-8"><title>{name}</title>
+<style>
+@font-face {{ font-family: "Specimen"; src: url(data:font/ttf;base64,{b64}); }}
+:root {{ color-scheme: light dark; }}
+body {{ margin: 0; font: 13px/1.5 system-ui, sans-serif;
+       background: Canvas; color: CanvasText; }}
+header {{ position: sticky; top: 0; padding: 12px 20px; background: Canvas;
+         border-bottom: 1px solid color-mix(in srgb, CanvasText 15%, transparent);
+         display: flex; gap: 18px; align-items: center; flex-wrap: wrap; z-index: 1; }}
+h1 {{ font-size: 14px; margin: 0 auto 0 0; font-weight: 600; }}
+label {{ display: flex; gap: 6px; align-items: center; }}
+section {{ padding: 8px 20px 28px; }}
+h2 {{ font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+     opacity: .5; margin: 26px 0 8px; }}
+.spec {{ font-family: "Specimen"; font-variant-ligatures: contextual common-ligatures;
+        white-space: pre-wrap; word-break: break-word; }}
+#grid {{ display: flex; flex-wrap: wrap; gap: 4px; }}
+#grid span {{ display: grid; place-items: center; background:
+  color-mix(in srgb, CanvasText 5%, transparent); border-radius: 4px; padding: .1em .25em; }}
+#live {{ outline: none; border: 1px dashed color-mix(in srgb, CanvasText 25%, transparent);
+        padding: 12px; border-radius: 6px; }}
+</style>
+<header>
+  <h1>{name}</h1>
+  <label>size <input id="sz" type="range" min="8" max="500" value="{size}">
+    <output id="szv">{size}</output>px</label>
+  <label><input id="lig" type="checkbox" checked> ligatures</label>
+  <label><input id="grd" type="checkbox" checked> cells</label>
+</header>
+<section>
+  <h2>Type here</h2>
+  <div id="live" class="spec" contenteditable spellcheck="false">{sample}</div>
+  <h2>Characters</h2><div id="grid" class="spec"></div>
+  <h2>Samples</h2><div id="samples" class="spec"></div>
+  <h2>Waterfall</h2><div id="wf"></div>
+</section>
+<script>
+const CHARS = {chars};
+const SAMPLES = {samples};
+const WF = {wfsizes};
+const grid = document.getElementById('grid');
+grid.innerHTML = [...CHARS].map(c => `<span>${{c.replace(/[<&]/g, m => m === '<' ? '&lt;' : '&amp;')}}</span>`).join('');
+document.getElementById('samples').innerHTML =
+  SAMPLES.map(s => `<div>${{s.replace(/[<&]/g, m => m === '<' ? '&lt;' : '&amp;')}}</div>`).join('');
+document.getElementById('wf').innerHTML = WF.map(s =>
+  `<div class="spec" style="font-size:${{s}}px">${{s}}&nbsp;&nbsp;{wftext}</div>`).join('');
+const sz = document.getElementById('sz'), szv = document.getElementById('szv');
+const apply = () => {{
+  szv.value = sz.value;
+  for (const el of [grid, document.getElementById('live'), document.getElementById('samples')])
+    el.style.fontSize = sz.value + 'px';
+}};
+sz.oninput = apply; apply();
+document.getElementById('lig').onchange = e =>
+  document.querySelectorAll('.spec').forEach(el =>
+    el.style.fontVariantLigatures = e.target.checked ? 'contextual common-ligatures' : 'none');
+document.getElementById('grd').onchange = e =>
+  grid.querySelectorAll('span').forEach(el => el.style.background = e.target.checked ? '' : 'none');
+</script>
+"""
+
+
+def render_html(args, path):
+    import json
+    b64 = base64.b64encode(path.read_bytes()).decode()
+    chars = args.text or (UPPER + LOWER + DIGITS + PUNCT)
+    out = Path(args.out) if args.out else path.with_suffix(".specimen.html")
+    out.write_text(HTML.format(
+        name=path.name, b64=b64, size=args.size, chars=json.dumps(chars),
+        samples=json.dumps(SAMPLES), wfsizes=json.dumps(WATERFALL_SIZES),
+        wftext=WATERFALL_TEXT, sample=SAMPLES[0]))
+    return out
+
+
+def open_file(p):
+    opener = {"Darwin": "open", "Windows": "start"}.get(platform.system(), "xdg-open")
+    try:
+        subprocess.run([opener, str(p)], check=False)
+    except FileNotFoundError:
+        pass
+
+
+def parse_var(spec):
+    out = []
+    for part in spec.split(","):
+        if "=" not in part:
+            sys.exit(f"--var expects tag=value, got {part!r}")
+        tag, value = part.split("=", 1)
+        out.append((tag.strip(), float(value)))
+    return out
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="font-render", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("font", type=Path)
+    p.add_argument("-s", "--size", type=int, default=160,
+                   help="glyph-grid size in px (default 160)")
+    p.add_argument("-t", "--text", help="render these characters instead of A-Z/a-z/0-9/punct")
+    p.add_argument("-c", "--cols", type=int, help="grid columns (default: fit 13)")
+    p.add_argument("-o", "--out", help="output path")
+    p.add_argument("--sample-size", type=int, default=26, help="sample-line size (default 26)")
+    p.add_argument("--dark", action="store_true")
+    p.add_argument("--no-guides", action="store_true",
+                   help="hide baseline / x-height / advance-width guides")
+    p.add_argument("--only", choices=["grid", "waterfall", "samples"])
+    p.add_argument("--index", type=int, default=0, help="face index for .ttc/.otc")
+    p.add_argument("--var", help="variable-font axes, e.g. wght=700,wdth=90")
+    p.add_argument("--features", help="OpenType features; use = to pass a leading "
+                                      "minus, e.g. --features=-dlig or --features ss01")
+    p.add_argument("--no-liga", action="store_true", help="disable liga/clig/calt/dlig")
+    p.add_argument("--html", action="store_true", help="emit an interactive HTML page instead")
+    p.add_argument("--no-open", action="store_true")
+    args = p.parse_args()
+
+    path = args.font.expanduser()
+    if not path.is_file():
+        sys.exit(f"no such font: {path}")
+
+    if args.html:
+        out = render_html(args, path)
+    else:
+        if not features.check("raqm"):
+            print("note: Pillow lacks libraqm — ligatures/shaping disabled", file=sys.stderr)
+        layout = (ImageFont.Layout.RAQM if features.check("raqm")
+                  else ImageFont.Layout.BASIC)
+        variations = parse_var(args.var) if args.var else None
+        feats = [f.strip() for f in args.features.split(",")] if args.features else []
+        if args.no_liga:
+            feats += ["-liga", "-clig", "-calt", "-dlig"]
+        feats = feats or None
+        try:
+            out = render_png(args, path, layout, variations, feats)
+        except OSError as exc:
+            sys.exit(f"cannot render {path.name}: {exc}")
+
+    print(out)
+    if not args.no_open:
+        open_file(out)
+
+
+if __name__ == "__main__":
+    main()
